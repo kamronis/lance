@@ -202,18 +202,22 @@ fn apply_centroid_splits(
 async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     index: &IVFIndex<S, Q>,
     partition_id: usize,
-    mapping: &RowAddrRemap,
+    mapping: Arc<RowAddrRemap>,
     owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<(Q::Storage, S)> {
     let old_storage = index.load_partition_storage(partition_id, None).await?;
     let filtered_mapping;
     let mapping = if let Some(owned_fragments) = owned_fragments
-        && has_unowned_fragment_rows(old_storage.row_ids(), owned_fragments)
+        && has_unowned_fragment_rows(old_storage.row_ids().copied(), owned_fragments)
     {
-        filtered_mapping = remap_for_owned_fragments(mapping, old_storage.row_ids(), owned_fragments);
+        filtered_mapping = remap_for_owned_fragments(
+            mapping.clone(),
+            old_storage.row_ids().copied(),
+            owned_fragments,
+        );
         &filtered_mapping
     } else {
-        mapping
+        mapping.as_ref()
     };
     let storage = old_storage.remap(mapping)?;
     let graph = index.read_sub_index_batch(partition_id, None, None).await?;
@@ -632,19 +636,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .downcast_ref::<IVFIndex<S, Q>>()
                     .ok_or(Error::invalid_input("existing index is not IVF index"))?;
                 let (storage, index) = if S::name() == HNSW::name() {
-                    remap_hnsw_partition(ivf_index, part_id, &mapping, owned_fragments.as_deref())
-                        .await?
+                    remap_hnsw_partition(
+                        ivf_index,
+                        part_id,
+                        mapping.clone(),
+                        owned_fragments.as_deref(),
+                    )
+                    .await?
                 } else {
                     let part = ivf_index
                         .load_partition(part_id, false, &NoOpMetricsCollector)
                         .await?;
                     let filtered_mapping;
                     let mapping = if let Some(owned_fragments) = owned_fragments.as_deref()
-                        && has_unowned_fragment_rows(part.storage.row_ids(), owned_fragments)
-                    {
+                        && has_unowned_fragment_rows(
+                            part.storage.row_ids().copied(),
+                            owned_fragments,
+                        ) {
                         filtered_mapping = remap_for_owned_fragments(
-                            mapping.as_ref(),
-                            part.storage.row_ids(),
+                            mapping.clone(),
+                            part.storage.row_ids().copied(),
                             owned_fragments,
                         );
                         &filtered_mapping
