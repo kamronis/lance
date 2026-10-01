@@ -354,6 +354,9 @@ fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<Docume
                 }
                 return Ok(());
             }
+            // BM25F blends the target columns per row, so combined_fields is
+            // row-granular by construction and carries no granularity field.
+            IndexFtsQuery::CombinedFields(_) => Some(DocumentGranularity::Row),
         };
         match (*current, requested) {
             (_, None) => {}
@@ -437,6 +440,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
                 .map(|leaf| to_local_expr(&IndexFtsQuery::Match(leaf.clone())))
                 .collect::<Result<_>>()?,
         },
+        // BM25F needs corpus-wide field statistics that the in-memory index
+        // does not maintain, so there is no local expression for it.
+        IndexFtsQuery::CombinedFields(_) => {
+            return Err(Error::not_supported(
+                "MemTable full-text search does not support combined_fields (BM25F)".to_string(),
+            ));
+        }
     })
 }
 
@@ -695,8 +705,7 @@ impl MemTableScanner {
 
     /// Set the number of probes for IVF search.
     ///
-    /// This is a convenience method that sets both minimum and maximum nprobes
-    /// to the same value, guaranteeing exactly `n` partitions will be searched.
+    /// Sets both the minimum and maximum to `n`.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(ref mut q) = self.nearest {
             q.nprobes = n;
