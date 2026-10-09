@@ -32,7 +32,14 @@ fn bench_minhash_lsh(c: &mut Criterion) {
     let mut group = c.benchmark_group("minhash_lsh");
     group.sample_size(10);
 
-    for is_dense in [false, true] {
+    for (name, num_hashes, num_bands, dense_prefix, is_dense) in [
+        ("sparse_256", 256, 256, 0, false),
+        ("dense_prefix_256", 256, 256, 8, false),
+        ("sparse_64", 128, 64, 0, false),
+        ("sparse_32", 128, 32, 0, false),
+        ("default_16", 128, 16, 0, false),
+        ("dense_64", 64, 64, 0, true),
+    ] {
         let tempdir = tempfile::tempdir().unwrap();
         let path = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = runtime.block_on(async {
@@ -43,17 +50,17 @@ fn bench_minhash_lsh(c: &mut Criterion) {
             ))
         });
         let params = MinHashLshIndexParams {
-            num_hashes: if is_dense { 64 } else { 256 },
-            num_bands: if is_dense { 64 } else { 256 },
+            num_hashes,
+            num_bands,
             ..Default::default()
         };
         let query = (0..40)
             .map(|i| format!("word{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let texts: Vec<String> = (0..2000)
+        let texts: Vec<String> = (0..20_000)
             .map(|row| {
-                if is_dense {
+                if is_dense || row < dense_prefix {
                     query.clone()
                 } else {
                     (0..40)
@@ -77,7 +84,7 @@ fn bench_minhash_lsh(c: &mut Criterion) {
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(texts)) as ArrayRef,
-                Arc::new(UInt64Array::from_iter_values(0..2000)) as ArrayRef,
+                Arc::new(UInt64Array::from_iter_values(0..20_000)) as ArrayRef,
             ],
         )
         .unwrap();
@@ -109,15 +116,16 @@ fn bench_minhash_lsh(c: &mut Criterion) {
             warm.prewarm().await.unwrap();
             (cold, warm)
         });
-        let name = if is_dense { "dense" } else { "sparse" };
         let signature = warm.query_signature(&query).unwrap();
         let all = RowAddrMask::all_rows();
-        assert!(
-            !runtime
-                .block_on(warm.search_signature(&signature, 1, &all, &NoOpMetricsCollector))
-                .unwrap()
-                .is_empty()
-        );
+        let hits = runtime
+            .block_on(warm.search_signature(&signature, 1, &all, &NoOpMetricsCollector))
+            .unwrap();
+        // With several hashes per band this sparse corpus may have no collisions.
+        // These cases still measure the overhead of an empty bucket scan.
+        if num_bands >= 64 || is_dense || dense_prefix > 0 {
+            assert!(!hits.is_empty());
+        }
         let empty = RowAddrMask::from_allowed(RowAddrTreeMap::default());
         for (case, index, mask) in [
             ("cold_query", &cold, &all),
