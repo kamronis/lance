@@ -142,18 +142,9 @@ impl Stream for ListRetryStream {
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(error))) if Self::is_retryable(&error) => {
-                    if !this.is_lexically_ordered
-                        && let Some(last_key) = &this.last_successful_key
-                    {
+                    if !this.is_lexically_ordered && this.last_successful_key.is_some() {
                         this.is_done = true;
-                        return Poll::Ready(Some(Err(object_store::Error::Generic {
-                                store: "list_retry",
-                                source: std::io::Error::other(format!(
-                                    "unordered listing failed after emitting key {last_key} for prefix {:?}; listing may be incomplete: {error}",
-                                    this.prefix
-                                ))
-                                .into(),
-                            })));
+                        return Poll::Ready(Some(Err(error)));
                     }
                     if this.current_retries < this.max_retries {
                         this.current_retries += 1;
@@ -433,7 +424,11 @@ mod tests {
         #[case] expects_error: bool,
     ) {
         let first = if is_partial {
-            vec![Ok(object_meta("prefix/b")), Err(retryable_error())]
+            vec![
+                Ok(object_meta("prefix/b")),
+                Err(retryable_error()),
+                Ok(object_meta("prefix/a")),
+            ]
         } else {
             vec![Err(retryable_error())]
         };
@@ -481,14 +476,14 @@ mod tests {
         }
         if expects_error {
             let error = items.last().unwrap().as_ref().unwrap_err();
-            assert!(matches!(error, object_store::Error::Generic { .. }));
-            let message = error.to_string();
-            assert!(message.contains("retryable list error"), "{message}");
-            if is_partial {
-                assert!(message.contains("prefix/b"), "{message}");
-                assert!(message.contains("prefix"), "{message}");
-                assert!(message.contains("incomplete"), "{message}");
-            }
+            assert!(matches!(
+                error,
+                object_store::Error::Generic {
+                    store: "scripted",
+                    ..
+                }
+            ));
+            assert_eq!(error.to_string(), retryable_error().to_string());
         } else {
             assert_eq!(items[0].as_ref().unwrap().location, Path::from("prefix/a"));
         }

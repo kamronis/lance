@@ -2197,7 +2197,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::IO { .. }), "{error}");
         assert!(
-            error.to_string().contains("listing may be incomplete"),
+            error
+                .to_string()
+                .contains("listing failed before the newest manifest"),
             "{error}"
         );
     }
