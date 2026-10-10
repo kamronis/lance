@@ -51,6 +51,10 @@ use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedLis
 
 use crate::object_store::ObjectStoreParams;
 
+/// Match ObjectStore's documented delete concurrency to bound in-flight operations
+/// and token reservations for stores without HTTP-level admission.
+const DELETE_CONCURRENCY: usize = 10;
+
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
@@ -744,6 +748,8 @@ impl HttpService for AimdHttpService {
                     response.status(),
                     ::http::StatusCode::TOO_MANY_REQUESTS | ::http::StatusCode::SERVICE_UNAVAILABLE
                 ),
+                // Non-throttle errors do not indicate capacity problems, matching
+                // the multipart write hook and the AIMD controller's policy.
                 Err(_) => false,
             };
             let outcome = if is_throttle {
@@ -1105,7 +1111,22 @@ impl ObjectStore for AimdThrottledStore {
                     // A successful bulk HTTP response can contain per-object
                     // throttle failures that only the native client can parse.
                     // Admission and request-level outcomes stay at the HTTP hook.
-                    if item.as_ref().err().is_some_and(is_throttle_error) {
+                    let is_unobserved_throttle = item.as_ref().err().is_some_and(|error| {
+                        let object_store::Error::Generic { source, .. } = error else {
+                            return false;
+                        };
+                        // Native per-object errors have no nested source. RetryError
+                        // wraps RequestError: only its successful-status error body
+                        // needs feedback here; HTTP failures were already observed.
+                        // These private types cannot be downcast through the public API.
+                        let is_parsed_response = source.source().is_none_or(|cause| {
+                            cause
+                                .to_string()
+                                .starts_with("Server returned error response:")
+                        });
+                        is_parsed_response && is_throttle_error(error)
+                    });
+                    if is_unobserved_throttle {
                         delete.observe_outcome(&item);
                     }
                     item
@@ -1127,7 +1148,7 @@ impl ObjectStore for AimdThrottledStore {
                     Ok(location)
                 }
             })
-            .buffered(10)
+            .buffered(DELETE_CONCURRENCY)
             .boxed()
     }
 
@@ -1441,15 +1462,18 @@ mod tests {
     #[cfg(feature = "aws")]
     #[tokio::test]
     #[rstest]
-    #[case::single_request(0, Some(1), "AccessDenied", true, 110.0)]
-    #[case::native_retry(1, Some(2), "AccessDenied", true, 50.0)]
-    #[case::parsed_slowdown(0, Some(1), "slowdown", true, 50.0)]
-    #[case::native_slowdown(0, None, "SlowDown", false, 50.0)]
+    #[case::single_request(0, Some(1), "AccessDenied", true, 0.0, 110.0)]
+    #[case::native_retry(1, Some(2), "AccessDenied", true, 0.0, 50.0)]
+    #[case::exhausted_retries(3, Some(2), "SlowDown", false, 0.0, 50.0)]
+    #[case::exhausted_retries_counted_once(3, Some(2), "SlowDown", false, 0.7, 110.0)]
+    #[case::parsed_slowdown(0, Some(1), "slowdown", true, 0.0, 50.0)]
+    #[case::native_slowdown(0, None, "SlowDown", false, 0.0, 50.0)]
     async fn test_native_s3_bulk_delete_keeps_per_object_results(
         #[case] failures: usize,
         #[case] expected_requests: Option<usize>,
         #[case] error_code: &'static str,
         #[case] has_per_object_result: bool,
+        #[case] throttle_threshold: f64,
         #[case] expected_rate: f64,
     ) {
         use futures::stream;
@@ -1461,10 +1485,17 @@ mod tests {
         let config = AimdThrottleConfig::default().with_delete_aimd(
             AimdConfig::default()
                 .with_initial_rate(100.0)
+                .with_throttle_threshold(throttle_threshold)
                 .with_additive_increment(10.0)
                 .with_window_duration(std::time::Duration::from_millis(100)),
         );
         let state = AimdThrottleState::new(config).unwrap();
+        // With one prior success, two throttled attempts give a 2/3 ratio.
+        // Counting the final error again would give 3/4 and cross the 0.7 threshold.
+        state
+            .delete
+            .controller
+            .record_outcome(RequestOutcome::Success);
         let connector = AimdHttpConnector::new(
             BulkDeleteConnector {
                 requests: Arc::clone(&requests),
@@ -1675,6 +1706,42 @@ mod tests {
         assert!(results.next().await.is_none());
         assert!(target.head(&first).await.is_err());
         assert!(target.head(&second).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_generic_delete_throttle_error_reduces_rate() {
+        let target = Arc::new(RetryTestMockStore::new(1));
+        let config = AimdThrottleConfig {
+            max_retries: 0,
+            ..Default::default()
+        }
+        .with_delete_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_window_duration(std::time::Duration::from_millis(100)),
+        );
+        let throttled = AimdThrottledStore::new(target.clone(), config).unwrap();
+        let results = throttled
+            .delete_stream(futures::stream::iter([Ok(Path::from("object"))]).boxed())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        let error = results[0].as_ref().unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Server returned non-2xx status code: 503")
+        );
+        assert_eq!(*target.errors_remaining.lock().unwrap(), 0);
+
+        // AIMD uses std::time::Instant, which Tokio's paused clock cannot advance.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        throttled
+            .delete
+            .controller
+            .record_outcome(RequestOutcome::Success);
+        assert_eq!(throttled.delete.controller.current_rate(), 50.0);
     }
 
     /// One page of a fixed directory, counting the requests that reached it.
@@ -2497,7 +2564,7 @@ mod tests {
     }
 
     /// A mock store that returns a configurable number of throttle errors
-    /// before succeeding on `get` operations. Used to test the retry logic
+    /// before succeeding on `get` and delete operations. Used to test the retry logic
     /// inside `OperationThrottle::throttled()`.
     struct RetryTestMockStore {
         inner: InMemory,
@@ -2513,6 +2580,19 @@ mod tests {
                 inner: InMemory::new(),
                 errors_remaining: std::sync::Mutex::new(errors_before_success),
                 get_call_count: AtomicU64::new(0),
+            }
+        }
+
+        fn take_throttle_error(&self) -> OSResult<()> {
+            let mut remaining = self.errors_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(object_store::Error::Generic {
+                    store: "RetryTestMock",
+                    source: THROTTLE_ERROR_RESPONSE.into(),
+                })
+            } else {
+                Ok(())
             }
         }
     }
@@ -2548,23 +2628,8 @@ mod tests {
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             self.get_call_count.fetch_add(1, Ordering::Relaxed);
-            let should_error = {
-                let mut remaining = self.errors_remaining.lock().unwrap();
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_error {
-                Err(object_store::Error::Generic {
-                    store: "RetryTestMock",
-                    source: THROTTLE_ERROR_RESPONSE.into(),
-                })
-            } else {
-                self.inner.get_opts(location, options).await
-            }
+            self.take_throttle_error()?;
+            self.inner.get_opts(location, options).await
         }
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
@@ -2573,7 +2638,10 @@ mod tests {
             &self,
             locations: BoxStream<'static, OSResult<Path>>,
         ) -> BoxStream<'static, OSResult<Path>> {
-            self.inner.delete_stream(locations)
+            match self.take_throttle_error() {
+                Ok(()) => self.inner.delete_stream(locations),
+                Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+            }
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
             self.inner.list(prefix)
