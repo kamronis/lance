@@ -212,7 +212,6 @@ impl LogicalScalarIndex {
             coverage,
         })
     }
-
 }
 
 impl DeepSizeOf for LogicalScalarIndex {
@@ -708,6 +707,7 @@ mod tests {
     async fn test_segment_ownership_after_update(
         #[case] stable_row_ids: bool,
         #[case] nullable: bool,
+        #[values(IndexType::BTree, IndexType::Bitmap)] index_type: IndexType,
     ) {
         let batch = arrow_array::record_batch!(
             (
@@ -744,9 +744,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let params = ScalarIndexParams::default();
+        let params = ScalarIndexParams::for_builtin(match index_type {
+            IndexType::Bitmap => BuiltinIndexType::Bitmap,
+            _ => BuiltinIndexType::BTree,
+        });
         let old = dataset
-            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .create_index_builder(&["value"], index_type, &params)
             .name("value_idx".to_owned())
             .fragments(vec![0, 1])
             .execute_uncommitted()
@@ -775,7 +778,7 @@ mod tests {
             .clone();
         let moved_fragment = dataset.fragments().last().unwrap().id as u32;
         let new = dataset
-            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .create_index_builder(&["value"], index_type, &params)
             .name("value_idx".to_owned())
             .replace(true)
             .fragments(vec![moved_fragment])
