@@ -37,7 +37,7 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::ops::Range;
 #[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -308,12 +308,20 @@ impl SpillStore for LocalSpillStore {
         let write_backing = backing.clone();
         let inner = tokio::task::spawn_blocking(move || {
             // Recover if external temporary-directory cleanup removed the cached directory.
-            std::fs::create_dir_all(write_backing.directory.path()).map_err(|err| {
+            let directory_path = write_backing.directory.path();
+            #[cfg(unix)]
+            let create_directory = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory_path);
+            #[cfg(not(unix))]
+            let create_directory = std::fs::create_dir_all(directory_path);
+            create_directory.map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!(
                         "failed to create spill directory {} for spill {}: {err}",
-                        write_backing.directory.path().display(),
+                        directory_path.display(),
                         write_backing.fs_path.display(),
                     ),
                 )
@@ -642,6 +650,8 @@ mod tests {
     use super::*;
     use crate::object_store::ObjectStore;
     use rstest::rstest;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
 
     /// Write `data` to a fresh writer and shut it down.
@@ -811,6 +821,11 @@ mod tests {
         let (writer, spill) = store.new_spill().await.unwrap();
         assert_eq!(store.ensure_temp_dir().unwrap().path(), directory);
         assert!(directory.is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         finish_writer(writer, b"recovered").await.unwrap();
         let reader = spill.reader().await.unwrap();
         assert_eq!(reader.get_all().await.unwrap().as_ref(), b"recovered");
