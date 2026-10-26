@@ -307,7 +307,26 @@ impl SpillStore for LocalSpillStore {
         });
         let write_backing = backing.clone();
         let inner = tokio::task::spawn_blocking(move || {
-            let file = File::create(&write_backing.fs_path)?;
+            // Recover if external temporary-directory cleanup removed the cached directory.
+            std::fs::create_dir_all(write_backing.directory.path()).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to create spill directory {} for spill {}: {err}",
+                        write_backing.directory.path().display(),
+                        write_backing.fs_path.display(),
+                    ),
+                )
+            })?;
+            let file = File::create(&write_backing.fs_path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to create spill file {}: {err}",
+                        write_backing.fs_path.display(),
+                    ),
+                )
+            })?;
             Ok::<_, io::Error>(LocalSpillWriter {
                 file: Arc::new(SpillWriteFile {
                     file,
@@ -657,9 +676,16 @@ mod tests {
         assert_eq!(read_back.as_ref(), data);
     }
 
+    #[rstest]
+    #[case::uncapped(false)]
+    #[case::capped(true)]
     #[tokio::test]
-    async fn test_reader_requires_finished_writer() {
-        let store = LocalSpillStore::new().unwrap();
+    async fn test_reader_requires_finished_writer(#[case] is_capped: bool) {
+        let store = if is_capped {
+            LocalSpillStore::with_cap(100).unwrap()
+        } else {
+            LocalSpillStore::new().unwrap()
+        };
         let (mut writer, spill) = store.new_spill().await.unwrap();
         writer.write_all(b"partial").await.unwrap();
 
@@ -674,19 +700,41 @@ mod tests {
 
         // After shutdown the reader sees the bytes.
         Writer::shutdown(writer.as_mut()).await.unwrap();
+        let err = writer.write_all(b"suffix").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "spill write requested after shutdown");
+        assert_eq!(writer.tell().await.unwrap(), 7);
+        if let Some(quota) = &store.quota {
+            assert_eq!(quota.used.load(Ordering::Relaxed), 7);
+        }
+
         let reader = spill.reader().await.unwrap();
         assert_eq!(reader.get_all().await.unwrap().as_ref(), b"partial");
     }
 
+    #[rstest]
+    #[case::uncapped(false)]
+    #[case::capped(true)]
     #[tokio::test]
-    async fn test_reader_ready_after_async_shutdown() {
+    async fn test_reader_ready_after_async_shutdown(#[case] is_capped: bool) {
         // Shutting down through the `AsyncWrite` surface (not the `Writer`
         // trait) must also mark the spill readable — covers poll_shutdown's
         // flag set, the path the `Writer::shutdown` tests don't reach.
-        let store = LocalSpillStore::new().unwrap();
+        let store = if is_capped {
+            LocalSpillStore::with_cap(100).unwrap()
+        } else {
+            LocalSpillStore::new().unwrap()
+        };
         let (mut writer, spill) = store.new_spill().await.unwrap();
         writer.write_all(b"async").await.unwrap();
         AsyncWriteExt::shutdown(&mut writer).await.unwrap();
+        let err = writer.write_all(b"suffix").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "spill write requested after shutdown");
+        assert_eq!(writer.tell().await.unwrap(), 5);
+        if let Some(quota) = &store.quota {
+            assert_eq!(quota.used.load(Ordering::Relaxed), 5);
+        }
 
         let reader = spill.reader().await.unwrap();
         assert_eq!(reader.get_all().await.unwrap().as_ref(), b"async");
@@ -741,6 +789,76 @@ mod tests {
         assert!(path.exists());
         drop(spill);
         assert!(!path.exists(), "spill file should be deleted on drop");
+    }
+
+    #[rstest]
+    #[case::uncapped(false)]
+    #[case::capped(true)]
+    #[tokio::test]
+    async fn test_new_spill_recreates_missing_directory(#[case] is_capped: bool) {
+        let store = if is_capped {
+            LocalSpillStore::with_cap(100).unwrap()
+        } else {
+            LocalSpillStore::new().unwrap()
+        };
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, b"initial").await.unwrap();
+        drop(spill);
+        let directory = store.ensure_temp_dir().unwrap().path().to_owned();
+        std::fs::remove_dir(&directory).unwrap();
+        assert!(!directory.exists());
+
+        let (writer, spill) = store.new_spill().await.unwrap();
+        assert_eq!(store.ensure_temp_dir().unwrap().path(), directory);
+        assert!(directory.is_dir());
+        finish_writer(writer, b"recovered").await.unwrap();
+        let reader = spill.reader().await.unwrap();
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), b"recovered");
+        let path = directory.join("spill_000001.bin");
+        assert!(path.exists());
+        drop(reader);
+        drop(spill);
+        assert!(!path.exists());
+        if let Some(quota) = &store.quota {
+            assert_eq!(quota.used.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[rstest]
+    #[case::directory_creation(true, "failed to create spill directory")]
+    #[case::file_creation(false, "failed to create spill file")]
+    #[tokio::test]
+    async fn test_new_spill_error_includes_path(
+        #[case] is_directory_obstructed: bool,
+        #[case] operation: &str,
+    ) {
+        let store = LocalSpillStore::with_cap(100).unwrap();
+        let directory = store.ensure_temp_dir().unwrap().path().to_owned();
+        let path = directory.join("spill_000000.bin");
+        if is_directory_obstructed {
+            std::fs::remove_dir(&directory).unwrap();
+            std::fs::write(&directory, b"obstruction").unwrap();
+        } else {
+            std::fs::create_dir(&path).unwrap();
+        }
+
+        let Err(err) = store.new_spill().await else {
+            panic!("spill allocation should fail for an obstructed path");
+        };
+        assert!(matches!(err, Error::IO { .. }), "expected IO, got {err:?}");
+        let message = err.to_string();
+        assert!(message.contains(operation), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Relaxed),
+            0
+        );
+        if is_directory_obstructed {
+            assert!(message.contains(directory.to_str().unwrap()), "{message}");
+            std::fs::remove_file(&directory).unwrap();
+        } else {
+            std::fs::remove_dir(&path).unwrap();
+        }
     }
 
     #[tokio::test]
