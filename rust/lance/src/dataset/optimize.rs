@@ -110,7 +110,9 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
-use crate::index::{DatasetIndexInternalExt, index_is_usable, load_all_indices};
+use crate::index::{
+    DatasetIndexInternalExt, index_is_usable, load_all_indices, segment_has_vector_details,
+};
 use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -3403,7 +3405,12 @@ async fn validate_fragment_groups_preserve_index_boundaries<'a>(
 ) -> Result<()> {
     let indices = load_all_indices(dataset).await?;
     let mut physical_index_boundaries = Vec::new();
-    for index in indices.iter().filter(|index| !is_system_index(index)) {
+    // Scalar indexes heal partial coverage through the fragment-reuse path.
+    // Only vector segments require all-or-nothing physical replacement here.
+    for index in indices
+        .iter()
+        .filter(|index| !is_system_index(index) && segment_has_vector_details(index))
+    {
         physical_index_boundaries.push((
             index.name.clone(),
             index.uuid,
