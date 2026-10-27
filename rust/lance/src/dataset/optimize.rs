@@ -12890,6 +12890,139 @@ mod tests {
         assert_vector_index_coverage(&dataset).await;
     }
 
+    #[tokio::test]
+    async fn test_stale_vector_segment_merge_requires_replan() {
+        const DIM: u32 = 4;
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_reader_rows(RowCount::from(64), BatchCount::from(4));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM as usize]), 4)
+                .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let template = CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata.clone())
+            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        for fragment_ids in [[0, 1], [2, 3]] {
+            let mut segment = template.clone();
+            segment.uuid = Uuid::new_v4();
+            segment.fragment_bitmap = Some(RoaringBitmap::from_iter(fragment_ids));
+            for file in template.files.as_ref().unwrap() {
+                dataset
+                    .object_store
+                    .copy(
+                        &dataset
+                            .indices_dir()
+                            .join(template.uuid.to_string())
+                            .join(file.path.as_str()),
+                        &dataset
+                            .indices_dir()
+                            .join(segment.uuid.to_string())
+                            .join(file.path.as_str()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            segments.push(segment);
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let stale = dataset.clone();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let stale_merged_result = rewrite_files(
+            Cow::Borrowed(&stale),
+            TaskData {
+                fragments: vec![fragments[1].clone(), fragments[2].clone()],
+            },
+            &options,
+        )
+        .await
+        .unwrap();
+        let disjoint_result = rewrite_files(
+            Cow::Borrowed(&stale),
+            TaskData {
+                fragments: vec![fragments[0].clone()],
+            },
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let mut concurrent = dataset.clone();
+        commit_compaction(
+            &mut concurrent,
+            vec![disjoint_result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let after_concurrent = Dataset::open(test_dir.as_str()).await.unwrap();
+        let expected_fragments = after_concurrent.manifest.fragments.clone();
+        let expected_indices = load_all_indices(&after_concurrent).await.unwrap();
+
+        let mut stale = stale;
+        let error = commit_compaction(
+            &mut stale,
+            vec![stale_merged_result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("a stale merged segment replacement must not be retried unchanged");
+        assert!(matches!(error, Error::IncompatibleTransaction { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("replan compaction from the latest dataset"),
+            "unexpected error: {error}"
+        );
+
+        let latest = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert_eq!(latest.manifest.fragments, expected_fragments);
+        assert_eq!(load_all_indices(&latest).await.unwrap(), expected_indices);
+
+        let mut latest = latest;
+        compact_files(&mut latest, options, None).await.unwrap();
+        assert_eq!(latest.get_fragments().len(), 1);
+        latest.validate().await.unwrap();
+        assert_vector_index_coverage(&latest).await;
+    }
+
     #[rstest]
     #[case::stable_row_ids(true, false, false)]
     #[case::deferred_remap(false, true, false)]
