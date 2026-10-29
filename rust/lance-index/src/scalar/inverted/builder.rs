@@ -6127,15 +6127,35 @@ mod tests {
                 .await?;
         assert_eq!(staged.params.memory_limit_mb, Some(64));
         assert_eq!(staged.params.num_workers, Some(2));
+        let expected_workers = 2.min(get_num_compute_intensive_cpus().max(1));
         let num_workers = resolve_num_workers(&staged.params);
-        assert_eq!(num_workers, 2);
+        assert_eq!(num_workers, expected_workers);
         let worker_limit = resolve_worker_memory_limit_bytes(&staged.params, num_workers);
-        assert_eq!(worker_limit, 32 << 20);
+        assert_eq!(worker_limit, (64_u64 << 20) / expected_workers as u64);
         assert_eq!(
             finalize_budget_bytes(&staged.params, worker_limit),
             64 << 20
         );
         Ok(())
+    }
+
+    #[rstest::rstest]
+    #[test]
+    fn test_staged_metadata_worker_environments(#[values("1", "2")] workers: &str) {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scalar::inverted::builder::tests::test_staged_metadata_carries_build_memory_config",
+            ])
+            .env("LANCE_CPU_THREADS", workers)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "workers={workers}\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     fn staged_for_plan(old_id: u64, stored_bytes: u64) -> StagedPartition {
