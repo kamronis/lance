@@ -4,7 +4,6 @@
 import os
 import shutil
 import subprocess
-import sys
 import tarfile
 import traceback
 from io import BytesIO
@@ -17,21 +16,14 @@ LANGUAGE_MODEL_HOME = language_model_home()
 def _safe_tar_extractall(tar, dest_dir):
     """Extract tar safely, blocking path traversal attacks (CVE-2007-4559).
 
-    On Python >= 3.12 uses the built-in ``filter="data"`` safeguard.
-    On older versions, manually validates every member path.
+    Requires the built-in data filter, including backported maintenance releases.
     """
-    if sys.version_info >= (3, 12):
+    if hasattr(tarfile, "data_filter"):
         tar.extractall(path=dest_dir, filter="data")
     else:
-        abs_dest = os.path.realpath(dest_dir)
-        for member in tar.getmembers():
-            member_path = os.path.join(dest_dir, member.name)
-            abs_member = os.path.realpath(member_path)
-            if not abs_member.startswith(abs_dest + os.sep) and abs_member != abs_dest:
-                raise Exception(
-                    f"Tar member '{member.name}' would extract outside target directory"
-                )
-        tar.extractall(path=dest_dir)
+        raise RuntimeError(
+            "Safe tar extraction requires Python with tarfile.data_filter"
+        )
 
 
 def check_lindera():
