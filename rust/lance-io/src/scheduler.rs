@@ -1210,6 +1210,7 @@ impl ScanScheduler {
     ///         .with_memory_reserver(pool)
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn with_memory_reserver(
         self: Arc<Self>,
         pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
@@ -1614,6 +1615,7 @@ impl FileScheduler {
     ///     Ok(())
     /// }
     /// ```
+    #[doc(hidden)]
     pub fn memory_reserver(&self) -> Option<Arc<dyn lance_core::utils::memory::MemoryReserver>> {
         self.reader.memory_reserver()
     }
