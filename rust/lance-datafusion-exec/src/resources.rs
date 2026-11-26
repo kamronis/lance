@@ -69,7 +69,9 @@ impl MemoryReserver for DataFusionMemoryReserver {
 }
 
 /// Retain one existing backing owner through every Arrow buffer and slice.
-/// This adds no reservation and does not copy the data.
+/// This adds no reservation and does not copy the data. The caller must have
+/// admitted the sidecar/control allowance before calling this function. The
+/// integration proof covers flat Int32 backing, not arbitrary decoder layouts.
 #[doc(hidden)]
 pub fn retain_batch_owner(
     batch: arrow_array::RecordBatch,

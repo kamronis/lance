@@ -61,6 +61,7 @@ async fn read_budget_sort_handoff_respects_build_pool(#[case] last_slice: bool) 
     let batches = (0..2)
         .map(|fragment| {
             let values = (fragment * ROWS..(fragment + 1) * ROWS)
+                .rev()
                 .map(|value| value as i32)
                 .collect::<Vec<_>>();
             Ok(RecordBatch::try_from_iter([(
@@ -166,7 +167,7 @@ async fn read_budget_sort_handoff_respects_build_pool(#[case] last_slice: bool) 
         let sorted = sorter.finish().await.unwrap();
         assert_eq!(sorted.num_rows(), ROWS);
         let ids = sorted["id"].as_primitive::<Int32Type>();
-        assert!(ids.values().windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(ids.values().iter().copied().eq(0..ROWS as i32));
         let slice = sorted.slice(1, 1);
         let charge = pool.reserved();
         evidence["sorted_output_and_control_bytes"] = serde_json::json!(charge);
@@ -214,7 +215,7 @@ async fn read_budget_sort_handoff_respects_build_pool(#[case] last_slice: bool) 
         assert_eq!(batch.num_rows(), ROWS);
         assert_eq!(
             batch["id"].as_primitive::<Int32Type>().value(0),
-            ROWS as i32
+            (2 * ROWS - 1) as i32
         );
         assert!(retry.try_next().await.unwrap().is_none());
         drop(batch);
