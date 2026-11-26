@@ -1148,6 +1148,8 @@ impl SpillStore for LocalSpillStore {
         self.metrics.allocated();
         let write_backing = backing.clone();
         let create = move || {
+            #[cfg(test)]
+            tests::wait_for_native_job(&write_backing.fs_path);
             // Recreate the scratch directory and its immediate parent after
             // external cleanup, requiring higher ancestors to still exist.
             // Retry outside the directory-init mutex and async executor. The
@@ -1509,6 +1511,8 @@ impl Spill for LocalSpill {
         let path = self.os_path.clone();
         // The blocking task owns the backing even if opening is cancelled.
         let open = move || {
+            #[cfg(test)]
+            tests::wait_for_native_job(&backing.fs_path);
             let file = File::open(&backing.fs_path)?;
             let size = usize::try_from(file.metadata()?.len())
                 .map_err(|err| Error::invalid_input(format!("spill size exceeds usize: {err}")))?;
@@ -2050,7 +2054,13 @@ mod tests {
     async fn test_new_spill_error_includes_path(
         #[case] is_directory_obstructed: bool,
         #[case] operation: &str,
+        #[values(false, true)] configured: bool,
     ) {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage: "unused",
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
         let store = LocalSpillStore::with_cap(100).unwrap();
         let directory = store.ensure_temp_dir().unwrap().path().to_owned();
         let path = directory.join("spill_000000.bin");
@@ -2061,9 +2071,21 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
         }
 
-        let Err(err) = store.new_spill().await else {
+        let result = if configured {
+            store
+                .with_memory_reserver(pool.clone())
+                .unwrap()
+                .new_spill()
+                .await
+        } else {
+            store.new_spill().await
+        };
+        let Err(err) = result else {
             panic!("spill allocation should fail for an obstructed path");
         };
+        pool.tasks.wait().await;
+        assert_eq!(pool.tasks.active(), 0);
+        assert_eq!(pool.tasks.peak(), usize::from(configured));
         assert!(matches!(err, Error::IO { .. }), "expected IO, got {err:?}");
         let message = err.to_string();
         assert!(message.contains(operation), "{message}");
@@ -2918,6 +2940,79 @@ mod tests {
         );
     }
 
+    // Per-path gates keep concurrent tests independent and exist only in test
+    // builds. The real native closure announces entry before it waits.
+    type NativeJobGate = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    static NATIVE_JOB_GATES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, NativeJobGate>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn wait_for_native_job(path: &std::path::Path) {
+        let gate = NATIVE_JOB_GATES.lock().unwrap().remove(path);
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+    }
+
+    #[rstest]
+    #[case::create(false)]
+    #[case::open(true)]
+    #[tokio::test]
+    async fn resource_spill_started_job_remains_tracked(#[case] opening: bool) {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage: "unused",
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let store = LocalSpillStore::with_cap(4).unwrap();
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let spill = if opening {
+            let (writer, spill) = scoped.new_spill().await.unwrap();
+            finish_writer(writer, b"data").await.unwrap();
+            Some(spill)
+        } else {
+            None
+        };
+        let path = store
+            .ensure_temp_dir()
+            .unwrap()
+            .path()
+            .join("spill_000000.bin");
+        let (started, ready) = tokio::sync::oneshot::channel();
+        // Disconnecting this sender also unblocks the native closure on panic.
+        let (release, blocked) = std::sync::mpsc::channel();
+        NATIVE_JOB_GATES
+            .lock()
+            .unwrap()
+            .insert(path, (started, blocked));
+        if let Some(spill) = &spill {
+            let mut open = Box::pin(spill.reader());
+            assert!(futures::poll!(&mut open).is_pending());
+            ready.await.unwrap();
+            drop(open);
+        } else {
+            let mut create = Box::pin(scoped.new_spill());
+            assert!(futures::poll!(&mut create).is_pending());
+            ready.await.unwrap();
+            drop(create);
+        }
+        assert_eq!(pool.tasks.active(), 1);
+        assert!(futures::FutureExt::now_or_never(pool.tasks.wait()).is_none());
+        drop(spill);
+        release.send(()).unwrap();
+        pool.tasks.wait().await;
+        assert_eq!(pool.tasks.active(), 0);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(store.metrics().snapshot().live_files, 0);
+    }
+
     #[rstest]
     #[case::create(false)]
     #[case::open(true)]
@@ -3019,6 +3114,43 @@ mod tests {
             store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn resource_spill_open_error_releases_task() {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage: "unused",
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let store = LocalSpillStore::with_cap(4).unwrap();
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let (writer, spill) = scoped.new_spill().await.unwrap();
+        finish_writer(writer, b"data").await.unwrap();
+        let path = store
+            .ensure_temp_dir()
+            .unwrap()
+            .path()
+            .join("spill_000000.bin");
+        std::fs::remove_file(&path).unwrap();
+        let error = spill.reader().await.err().unwrap();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        let Error::IO { source, .. } = &error else {
+            unreachable!()
+        };
+        assert_eq!(
+            source.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        pool.tasks.wait().await;
+        assert_eq!(pool.tasks.active(), 0);
+        assert!(pool.tasks.peak() > 0);
+        drop(spill);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(store.metrics().snapshot().live_files, 0);
     }
 
     #[tokio::test]
