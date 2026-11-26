@@ -15,3 +15,9 @@ pub mod exec;
 pub mod expr;
 pub mod udf;
 pub mod utils;
+
+#[doc(hidden)]
+pub mod resources;
+
+#[doc(hidden)]
+pub mod resource_sort;
