@@ -1147,7 +1147,7 @@ impl SpillStore for LocalSpillStore {
         });
         self.metrics.allocated();
         let write_backing = backing.clone();
-        let inner = tokio::task::spawn_blocking(move || {
+        let create = move || {
             // Recreate the scratch directory and its immediate parent after
             // external cleanup, requiring higher ancestors to still exist.
             // Retry outside the directory-init mutex and async executor. The
@@ -1187,8 +1187,17 @@ impl SpillStore for LocalSpillStore {
                 pending: None,
                 position: 0,
             })
-        })
-        .await??;
+        };
+        let inner = if let Some(pool) = &self.memory_pool {
+            lance_core::utils::tokio::io_task_with_resources(
+                pool.clone(),
+                "scratch file creation",
+                create,
+            )?
+            .await??
+        } else {
+            tokio::task::spawn_blocking(create).await??
+        };
         let writer = Box::new(SpillWriter {
             inner: Box::new(inner),
             backing: backing.clone(),
@@ -1499,7 +1508,7 @@ impl Spill for LocalSpill {
         let backing = self.backing.clone();
         let path = self.os_path.clone();
         // The blocking task owns the backing even if opening is cancelled.
-        tokio::task::spawn_blocking(move || {
+        let open = move || {
             let file = File::open(&backing.fs_path)?;
             let size = usize::try_from(file.metadata()?.len())
                 .map_err(|err| Error::invalid_input(format!("spill size exceeds usize: {err}")))?;
@@ -1512,8 +1521,17 @@ impl Spill for LocalSpill {
                 path,
                 size,
             }) as Box<dyn Reader>)
-        })
-        .await?
+        };
+        if let Some(pool) = &self.backing.memory_pool {
+            lance_core::utils::tokio::io_task_with_resources(
+                pool.clone(),
+                "scratch file open",
+                open,
+            )?
+            .await?
+        } else {
+            tokio::task::spawn_blocking(open).await?
+        }
     }
 }
 
@@ -2896,6 +2914,109 @@ mod tests {
         drop(spill);
         assert_eq!(
             store.quota.as_ref().unwrap().used.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[rstest]
+    #[case::create(false)]
+    #[case::open(true)]
+    #[test]
+    fn resource_spill_cancelled_native_job_remains_tracked(#[case] opening: bool) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = Arc::new(RefuseIoAdmission {
+                stage: "unused",
+                refuse: AtomicBool::new(false),
+                tasks: Arc::default(),
+            });
+            let store = LocalSpillStore::with_cap(4).unwrap();
+            let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+            let spill = if opening {
+                let (writer, spill) = scoped.new_spill().await.unwrap();
+                finish_writer(writer, b"data").await.unwrap();
+                Some(spill)
+            } else {
+                None
+            };
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+            ready.await.unwrap();
+            if let Some(spill) = &spill {
+                let mut open = Box::pin(spill.reader());
+                assert!(futures::poll!(&mut open).is_pending());
+                drop(open);
+            } else {
+                let mut create = Box::pin(scoped.new_spill());
+                assert!(futures::poll!(&mut create).is_pending());
+                drop(create);
+            }
+            assert_eq!(pool.tasks.active(), 1);
+            assert!(futures::FutureExt::now_or_never(pool.tasks.wait()).is_none());
+            drop(spill);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            pool.tasks.wait().await;
+            assert_eq!(pool.tasks.active(), 0);
+            assert_eq!(
+                store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(store.metrics().snapshot().live_files, 0);
+        });
+    }
+
+    #[rstest]
+    #[case::create(false)]
+    #[case::open(true)]
+    #[tokio::test]
+    async fn resource_spill_native_admission_refusal(
+        #[case] opening: bool,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage: "I/O await future",
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let store = LocalSpillStore::with_cap(4).unwrap();
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let spill = if opening {
+            let (writer, spill) = scoped.new_spill().await.unwrap();
+            finish_writer(writer, b"data").await.unwrap();
+            Some(spill)
+        } else {
+            None
+        };
+        if cancelled {
+            pool.tasks.cancel();
+        } else {
+            pool.refuse.store(true, Ordering::Relaxed);
+        }
+        let error = if let Some(spill) = &spill {
+            spill.reader().await.err().unwrap()
+        } else {
+            scoped.new_spill().await.err().unwrap()
+        };
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains(if cancelled {
+            "cancelled before dispatch"
+        } else {
+            "I/O await future"
+        }));
+        assert_eq!(pool.tasks.active(), 0);
+        drop(spill);
+        assert_eq!(store.metrics().snapshot().live_files, 0);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
             0
         );
     }
