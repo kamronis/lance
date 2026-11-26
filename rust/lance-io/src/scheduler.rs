@@ -33,6 +33,9 @@ mod lite;
 const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
+// Covers Bytes::from_owner reference-count storage and allocation control,
+// without depending on bytes' private owner-wrapper layout.
+const REASSEMBLY_CONTROL_BYTES: usize = 1024;
 const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
 
 /// Storage option used to configure scheduler error handling.
@@ -1736,6 +1739,7 @@ impl FileScheduler {
                             ))
                         })?;
                         let reservation_bytes = length.checked_add(size_of::<crate::local::resources::OwnedIoBuffer>())
+                            .and_then(|bytes| bytes.checked_add(REASSEMBLY_CONTROL_BYTES))
                             .ok_or_else(|| Error::invalid_input(format!("read reassembly reservation overflow: requested_bytes={orig_size}")))?;
                         let reservation = memory_reserver
                             .as_ref()
@@ -2019,10 +2023,15 @@ mod tests {
         drop(outputs);
         drop(reader);
         drop(scheduler);
-        let retained = first.len() + size_of::<crate::local::resources::OwnedIoBuffer>();
+        let retained = first.len()
+            + size_of::<crate::local::resources::OwnedIoBuffer>()
+            + REASSEMBLY_CONTROL_BYTES;
         assert_eq!(pool.used.load(Ordering::Acquire), retained as u64);
-        let slice = first.clone().slice(1..3);
+        let clone = first.clone();
         drop(first);
+        assert_eq!(pool.used.load(Ordering::Acquire), retained as u64);
+        let slice = clone.slice(1..3);
+        drop(clone);
         assert_eq!(slice.as_ref(), &data[1..3]);
         assert_eq!(pool.used.load(Ordering::Acquire), retained as u64);
         drop(slice);
