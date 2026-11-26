@@ -21,15 +21,15 @@ use std::os::unix::fs::FileExt;
 use super::LocalObjectReader;
 use crate::{traits::ByteStream, utils::tracking_store::IOTracker};
 
-pub(super) struct ReaderResources {
-    _control: Box<dyn Send + Sync>,
+// Close the final file handle before returning its file-state allowance.
+pub(super) struct LocalFile {
+    pub(super) file: Arc<File>,
+    pub(super) _control: Option<Box<dyn Send + Sync>>,
 }
 
-impl std::fmt::Debug for ReaderResources {
+impl std::fmt::Debug for LocalFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ReaderResources")
-            .finish_non_exhaustive()
+        formatter.debug_struct("LocalFile").finish_non_exhaustive()
     }
 }
 
@@ -71,8 +71,10 @@ impl LocalObjectReader {
             })?;
             Ok(Box::new(Self {
                 memory_pool: Some(reader_pool),
-                _resources: Some(ReaderResources { _control: control }),
-                file: Arc::new(file),
+                file: Arc::new(LocalFile {
+                    file: Arc::new(file),
+                    _control: Some(control),
+                }),
                 block_size,
                 size: tokio::sync::OnceCell::new_with(known_size),
                 path,
@@ -83,7 +85,7 @@ impl LocalObjectReader {
     }
 
     pub(super) fn read_with_resources(
-        file: Arc<File>,
+        file: Arc<LocalFile>,
         path: Path,
         tracker: Arc<IOTracker>,
         pool: Arc<dyn MemoryReserver>,
@@ -110,7 +112,7 @@ impl LocalObjectReader {
                         bytes: vec![0; length],
                         _reservation: owner,
                     };
-                    read_exact(file, &mut data.bytes, offset)?;
+                    read_exact(file.file.clone(), &mut data.bytes, offset)?;
                     Ok(Bytes::from_owner(data))
                 },
             )?

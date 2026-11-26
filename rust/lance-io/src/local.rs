@@ -242,7 +242,7 @@ pub(crate) mod resources;
 pub struct LocalObjectReader {
     memory_pool: Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>,
     /// File handler.
-    file: Arc<File>,
+    file: Arc<resources::LocalFile>,
 
     /// Fie path.
     path: Path,
@@ -256,7 +256,6 @@ pub struct LocalObjectReader {
 
     /// IO tracker for monitoring read operations.
     io_tracker: Arc<IOTracker>,
-    _resources: Option<resources::ReaderResources>,
 }
 
 impl DeepSizeOf for LocalObjectReader {
@@ -307,8 +306,10 @@ impl LocalObjectReader {
             let size = OnceCell::new_with(known_size);
             Ok(Box::new(Self {
                 memory_pool: None,
-                _resources: None,
-                file: Arc::new(file),
+                file: Arc::new(resources::LocalFile {
+                    file: Arc::new(file),
+                    _control: None,
+                }),
                 block_size,
                 size,
                 path,
@@ -362,7 +363,7 @@ impl Reader for LocalObjectReader {
                         lance_core::utils::tokio::io_task_with_resources(
                             pool.clone(),
                             "local file metadata",
-                            move || file.metadata(),
+                            move || file.file.metadata(),
                         )?
                         .await?
                         .map_err(|source| object_store::Error::Generic {
@@ -370,7 +371,8 @@ impl Reader for LocalObjectReader {
                             source: Box::new(source),
                         })
                     } else {
-                        join_local_io(tokio::task::spawn_blocking(move || file.metadata())).await
+                        join_local_io(tokio::task::spawn_blocking(move || file.file.metadata()))
+                            .await
                     };
                     metrics.record(&result, 0);
                     Ok(result?.len() as usize)
@@ -406,9 +408,9 @@ impl Reader for LocalObjectReader {
                 // written to below and we check all data is initialized at that point.
                 unsafe { buf.set_len(range.len()) };
                 #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
+                file.file.read_exact_at(buf.as_mut(), range.start as u64)?;
                 #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
+                read_exact_at(file.file.clone(), buf.as_mut(), range.start as u64)?;
 
                 Ok(buf.freeze())
             }))
@@ -433,14 +435,15 @@ impl Reader for LocalObjectReader {
             });
         }
         Box::pin(async move {
-            let mut file = self.file.clone();
+            let file = self.file.clone();
             let io_tracker = self.io_tracker.clone();
             let path = self.path.clone();
 
             let metrics = io_tracker.begin_io("get");
             let result = join_local_io(tokio::task::spawn_blocking(move || {
                 let mut buf = Vec::new();
-                file.read_to_end(buf.as_mut())?;
+                let mut handle = file.file.as_ref();
+                handle.read_to_end(buf.as_mut())?;
                 Ok(Bytes::from(buf))
             }))
             .await;
@@ -462,7 +465,7 @@ impl Reader for LocalObjectReader {
                 return Ok(self.stream_with_resources(0..size));
             }
             Ok(stream_local_range(
-                self.file.clone(),
+                self.file.file.clone(),
                 self.path.clone(),
                 self.io_tracker.clone(),
                 0..size,
@@ -485,7 +488,11 @@ impl Reader for LocalObjectReader {
         let chunk_size = self.block_size.max(8 * 1024);
         Box::pin(async move {
             Ok(stream_local_range(
-                file, path, io_tracker, range, chunk_size,
+                file.file.clone(),
+                path,
+                io_tracker,
+                range,
+                chunk_size,
             ))
         })
     }
@@ -1077,6 +1084,91 @@ mod tests {
                 "must be configured before opening files and can only be configured once"
             )
         );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_detached_stream_retains_file_state(#[values(false, true)] whole: bool) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [7_u8; 64]).unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 64 * 1024,
+            ..Default::default()
+        });
+        let reader = ObjectStore::local()
+            .open_with_memory_reserver(
+                &Path::from_filesystem_path(file.path()).unwrap(),
+                Some(64),
+                pool.clone(),
+            )
+            .await
+            .unwrap();
+        let baseline = pool.used.load(Ordering::Acquire);
+        assert!(baseline > 0);
+        let mut first = if whole {
+            reader.get_stream().await.unwrap()
+        } else {
+            reader.get_range_stream(0..64).await.unwrap()
+        };
+        let second = reader.get_range_stream(0..64).await.unwrap();
+        drop(reader);
+        assert_eq!(pool.used.load(Ordering::Acquire), baseline);
+        drop(second);
+        assert_eq!(pool.used.load(Ordering::Acquire), baseline);
+        let bytes = first.try_next().await.unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), &[7_u8; 64]);
+        drop(first);
+        assert_eq!(pool.used.load(Ordering::Acquire), 64 + 1024);
+        let slice = bytes.slice(1..2);
+        drop(bytes);
+        assert_eq!(pool.used.load(Ordering::Acquire), 64 + 1024);
+        drop(slice);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn resource_detached_stream_queued_read_retains_file_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), [7_u8; 64]).unwrap();
+            let pool = Arc::new(ReadPool {
+                limit: 64 * 1024,
+                ..Default::default()
+            });
+            let reader = ObjectStore::local()
+                .open_with_memory_reserver(
+                    &Path::from_filesystem_path(file.path()).unwrap(),
+                    Some(64),
+                    pool.clone(),
+                )
+                .await
+                .unwrap();
+            let baseline = pool.used.load(Ordering::Acquire);
+            let mut stream = reader.get_range_stream(0..64).await.unwrap();
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            // Disconnecting the sender also releases the gate on assertion failure.
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+            ready.await.unwrap();
+            assert!(futures::poll!(stream.try_next()).is_pending());
+            drop(stream);
+            drop(reader);
+            assert!(pool.used.load(Ordering::Acquire) >= baseline);
+            assert!(pool.tasks.active() > 0);
+            assert!(futures::FutureExt::now_or_never(pool.tasks.wait()).is_none());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            pool.tasks.wait().await;
+            assert_eq!(pool.used.load(Ordering::Acquire), 0);
+        });
     }
 
     #[rstest::rstest]
