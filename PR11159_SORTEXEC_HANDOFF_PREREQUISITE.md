@@ -65,7 +65,7 @@ trait SortMemoryHandoff: Send + Sync {
 }
 
 // Optional configuration on SortExec::new(ordering, input).
-fn with_memory_handoff(self, handoff: Arc<dyn SortMemoryHandoff>) -> Self;
+// pub fn with_memory_handoff(self, handoff: Arc<dyn SortMemoryHandoff>) -> Self;
 ```
 
 This is a proposal, not an implemented or supported DataFusion API. Its producer
