@@ -387,7 +387,6 @@ impl<T: Send + 'static, F: FnOnce() -> Result<T> + Send + 'static> PendingWork<F
             // announcing completion. The channel is only used by this async
             // driver; the pure CPU closure never sends or waits.
             let _ = completed.send(outcome);
-            drop(running);
         }
         .instrument(tracing::Span::current());
         // Charge the concrete completion future separately before Tokio stores it.
@@ -396,8 +395,10 @@ impl<T: Send + 'static, F: FnOnce() -> Result<T> + Send + 'static> PendingWork<F
             .pool
             .reserve("CPU completion future", size_of_val(&driver))?;
         let driver = async move {
+            // Task completion includes disposition and completion-only control.
+            let completion = (driver_control, running);
             driver.await;
-            drop(driver_control);
+            drop(completion);
         };
         global_cpu_runtime().spawn(driver).await.map_err(|source| {
             Error::internal(format!(

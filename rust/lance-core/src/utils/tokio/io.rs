@@ -67,7 +67,6 @@ pub fn io_task_with_resources<T: Send + 'static, F: FnOnce() -> T + Send + 'stat
             .await;
         let _ = completed.send(result);
         drop(control);
-        drop(running);
     };
     let driver_control = pool.reserve("I/O completion future", size_of_val(&driver))?;
     // Build and admit the public await before dispatch. Transfer the actual
@@ -109,8 +108,10 @@ pub fn io_task_with_resources<T: Send + 'static, F: FnOnce() -> T + Send + 'stat
     };
     let await_control = pool.reserve("I/O await future", size_of_val(&future))?;
     let driver = global_cpu_runtime().spawn(async move {
+        // Tuple field order also preserves cleanup-before-completion on unwind.
+        let completion = (driver_control, running);
         driver.await;
-        drop(driver_control);
+        drop(completion);
     });
     // The receiver is owned by `future` and cannot have been dropped or polled.
     let _ = dispatch.send(driver);

@@ -1234,4 +1234,116 @@ mod tests {
         drop(value);
         assert_eq!(pool.used.load(Ordering::Relaxed), 0);
     }
+
+    #[derive(Debug)]
+    struct CompletionOrderPool {
+        tasks: Arc<crate::utils::tasks::ResourceTaskGroup>,
+        active_at_release: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+        live_control: Arc<AtomicUsize>,
+    }
+
+    struct CompletionControl {
+        tasks: Arc<crate::utils::tasks::ResourceTaskGroup>,
+        active_at_release: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+        live_control: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for CompletionControl {
+        fn drop(&mut self) {
+            self.active_at_release
+                .store(self.tasks.active(), Ordering::SeqCst);
+            self.live_control.fetch_sub(self.bytes, Ordering::SeqCst);
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl MemoryReserver for CompletionOrderPool {
+        fn task_group(&self) -> Option<Arc<crate::utils::tasks::ResourceTaskGroup>> {
+            Some(self.tasks.clone())
+        }
+
+        fn reserve(&self, stage: &str, bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            if matches!(stage, "I/O completion future" | "CPU completion future") {
+                self.live_control.fetch_add(bytes, Ordering::SeqCst);
+                Ok(Box::new(CompletionControl {
+                    tasks: self.tasks.clone(),
+                    active_at_release: self.active_at_release.clone(),
+                    releases: self.releases.clone(),
+                    live_control: self.live_control.clone(),
+                    bytes,
+                }))
+            } else {
+                Ok(Box::new(()))
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CompletionOutcome {
+        Success,
+        Error,
+        Panic,
+    }
+
+    #[rstest]
+    #[case::io_success(false, CompletionOutcome::Success)]
+    #[case::io_error(false, CompletionOutcome::Error)]
+    #[case::io_panic(false, CompletionOutcome::Panic)]
+    #[case::cpu_success(true, CompletionOutcome::Success)]
+    #[case::cpu_error(true, CompletionOutcome::Error)]
+    #[case::cpu_panic(true, CompletionOutcome::Panic)]
+    #[tokio::test]
+    async fn resource_completion_control_precedes_task_completion(
+        #[case] is_cpu: bool,
+        #[case] outcome: CompletionOutcome,
+        #[values(false, true)] cancelled: bool,
+    ) {
+        let pool = Arc::new(CompletionOrderPool {
+            tasks: Arc::default(),
+            active_at_release: Arc::new(AtomicUsize::new(usize::MAX)),
+            releases: Arc::default(),
+            live_control: Arc::default(),
+        });
+        let work = move || match outcome {
+            CompletionOutcome::Success => Ok(()),
+            CompletionOutcome::Error => Err(Error::execution("native failure")),
+            CompletionOutcome::Panic => panic!("native panic"),
+        };
+        let future = if is_cpu {
+            let task =
+                cpu_task_with_resources(pool.clone(), "completion order", 0, Arc::new(()), work)
+                    .unwrap();
+            async move { task.await.map(drop) }.boxed()
+        } else {
+            let task = io_task_with_resources(pool.clone(), "completion order", work).unwrap();
+            async move { task.await? }.boxed()
+        };
+        let mut future = std::panic::AssertUnwindSafe(future).catch_unwind();
+        if cancelled {
+            // Poll the lazy CPU path to dispatch it; no worker waits for this test.
+            let _ = futures::poll!(&mut future);
+            drop(future);
+        } else {
+            match (outcome, future.await) {
+                (CompletionOutcome::Success, Ok(Ok(()))) | (CompletionOutcome::Panic, Err(_)) => {}
+                (CompletionOutcome::Error, Ok(Err(error))) => {
+                    assert!(matches!(error, Error::Execution { .. }));
+                    assert!(error.to_string().contains("native failure"));
+                }
+                (_, result) => panic!("unexpected completion: {result:?}"),
+            }
+        }
+        pool.tasks.wait().await;
+        assert_eq!(pool.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pool.active_at_release.load(Ordering::SeqCst),
+            1,
+            "completion control must be released before the task token"
+        );
+        assert_eq!(pool.live_control.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.tasks.active(), 0);
+    }
 }
