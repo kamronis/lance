@@ -22,6 +22,8 @@ struct StrictBuildPool {
     pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     denied: std::sync::Mutex<Option<(String, usize, usize)>>,
     peak: std::sync::atomic::AtomicUsize,
+    output_control_bytes: std::sync::atomic::AtomicUsize,
+    output_control_reservations: std::sync::atomic::AtomicUsize,
 }
 impl lance_core::utils::memory::MemoryReserver for StrictBuildPool {
     fn task_group(&self) -> Option<Arc<lance_core::utils::tasks::ResourceTaskGroup>> {
@@ -31,6 +33,13 @@ impl lance_core::utils::memory::MemoryReserver for StrictBuildPool {
         let result = self.adapter.reserve(stage, bytes);
         if result.is_err() {
             *self.denied.lock().unwrap() = Some((stage.to_owned(), bytes, self.pool.reserved()));
+        } else if stage == "inline allocation control" {
+            // Record the sort output's control admission independently of the
+            // pool total, so duplicate backing charges cannot become expected.
+            self.output_control_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            self.output_control_reservations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.peak
             .fetch_max(self.pool.reserved(), std::sync::atomic::Ordering::Relaxed);
@@ -103,6 +112,8 @@ async fn read_budget_sort_handoff_respects_build_pool(#[case] last_slice: bool) 
         pool: pool.clone(),
         denied: Default::default(),
         peak: Default::default(),
+        output_control_bytes: Default::default(),
+        output_control_reservations: Default::default(),
     });
     let read_policy =
         lance_io::read_budget::ReadMemoryBudget::new(1).with_memory_reserver(adapter.clone());
@@ -168,15 +179,38 @@ async fn read_budget_sort_handoff_respects_build_pool(#[case] last_slice: bool) 
         assert_eq!(sorted.num_rows(), ROWS);
         let ids = sorted["id"].as_primitive::<Int32Type>();
         assert!(ids.values().iter().copied().eq(0..ROWS as i32));
+        let output_backing = sorted.get_array_memory_size();
+        let output_control = adapter
+            .output_control_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            adapter
+                .output_control_reservations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the sorted output must have one control reservation"
+        );
+        assert!(output_control > 0);
+        let expected_charge = output_backing.checked_add(output_control).unwrap();
+        assert_eq!(
+            pool.reserved(),
+            expected_charge,
+            "sorted backing must be charged exactly once, plus admitted control"
+        );
         let slice = sorted.slice(1, 1);
-        let charge = pool.reserved();
-        evidence["sorted_output_and_control_bytes"] = serde_json::json!(charge);
+        evidence["sorted_output_backing_bytes"] = serde_json::json!(output_backing);
+        evidence["sorted_output_control_bytes"] = serde_json::json!(output_control);
+        evidence["sorted_output_and_control_bytes"] = serde_json::json!(expected_charge);
         drop(sorted);
         drop(dataset);
         drop(session);
         drop(context);
         tasks.wait().await;
-        assert_eq!(pool.reserved(), charge);
+        assert_eq!(
+            pool.reserved(),
+            expected_charge,
+            "the final slice must retain that same single backing charge"
+        );
         assert_eq!(slice["id"].as_primitive::<Int32Type>().value(0), 1);
         drop(slice);
         assert_eq!(pool.reserved(), 0);
