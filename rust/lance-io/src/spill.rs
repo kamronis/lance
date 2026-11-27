@@ -1125,29 +1125,38 @@ impl SpillStore for LocalSpillStore {
         } else {
             self._resource_owner.clone()
         };
-        let temp_dir = self.ensure_temp_dir()?;
-        let idx = self
-            .file_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| Error::invalid_input("spill file counter overflow"))?;
-        let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
-        let os_path = Path::from_absolute_path(&fs_path)?;
-        let backing = Arc::new(SpillBacking {
-            fs_path,
+        let state = Self {
+            temp_dir: self.temp_dir.clone(),
+            file_counter: self.file_counter.clone(),
             quota: self.quota.clone(),
-            file_usage: self.quota.as_ref().map(DiskQuota::track_file),
-            accepted: AtomicU64::new(0),
-            finished: AtomicBool::new(false),
-            directory: temp_dir,
+            parent_dir: self.parent_dir.clone(),
             metrics: self.metrics.clone(),
             memory_pool: self.memory_pool.clone(),
             _resource_owner: resource_owner,
-        });
-        self.metrics.allocated();
-        let write_backing = backing.clone();
+        };
         let create = move || {
+            let idx = state
+                .file_counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| Error::invalid_input("spill file counter overflow"))?;
+            let temp_dir = state.ensure_temp_dir()?;
+            let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
+            let os_path = Path::from_absolute_path(&fs_path)?;
+            let backing = Arc::new(SpillBacking {
+                fs_path,
+                quota: state.quota.clone(),
+                file_usage: state.quota.as_ref().map(DiskQuota::track_file),
+                accepted: AtomicU64::new(0),
+                finished: AtomicBool::new(false),
+                directory: temp_dir,
+                metrics: state.metrics.clone(),
+                memory_pool: state.memory_pool,
+                _resource_owner: state._resource_owner,
+            });
+            state.metrics.allocated();
+            let write_backing = backing.clone();
             #[cfg(test)]
             tests::wait_for_native_job(&write_backing.fs_path);
             // Recreate the scratch directory and its immediate parent after
@@ -1181,16 +1190,17 @@ impl SpillStore for LocalSpillStore {
                     ),
                 )
             })?;
-            Ok::<_, io::Error>(LocalSpillWriter {
+            let inner = LocalSpillWriter {
                 file: Arc::new(SpillWriteFile {
                     file,
                     _backing: write_backing,
                 }),
                 pending: None,
                 position: 0,
-            })
+            };
+            Ok::<_, Error>((inner, backing, os_path))
         };
-        let inner = if let Some(pool) = &self.memory_pool {
+        let (inner, backing, os_path) = if let Some(pool) = &self.memory_pool {
             lance_core::utils::tokio::io_task_with_resources(
                 pool.clone(),
                 "scratch file creation",
@@ -3076,13 +3086,23 @@ mod tests {
     async fn resource_spill_native_admission_refusal(
         #[case] opening: bool,
         #[values(false, true)] cancelled: bool,
+        #[values(
+            "I/O completion driver control",
+            "I/O completion future",
+            "I/O await future"
+        )]
+        stage: &'static str,
     ) {
         let pool = Arc::new(RefuseIoAdmission {
-            stage: "I/O await future",
+            stage,
             refuse: AtomicBool::new(false),
             tasks: Arc::default(),
         });
-        let store = LocalSpillStore::with_cap(4).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("new-parent");
+        let store = LocalSpillStore::with_cap(4)
+            .unwrap()
+            .with_parent_dir(&parent);
         let scoped = store.with_memory_reserver(pool.clone()).unwrap();
         let spill = if opening {
             let (writer, spill) = scoped.new_spill().await.unwrap();
@@ -3105,9 +3125,25 @@ mod tests {
         assert!(error.to_string().contains(if cancelled {
             "cancelled before dispatch"
         } else {
-            "I/O await future"
+            stage
         }));
         assert_eq!(pool.tasks.active(), 0);
+        if !opening {
+            assert!(
+                !parent.exists(),
+                "refused creation must not initialize its parent"
+            );
+            assert!(store.temp_dir.lock().unwrap().is_none());
+            if !cancelled {
+                // Retry the same first spill after transient admission refusal.
+                let (writer, created) = scoped.new_spill().await.unwrap();
+                finish_writer(writer, b"data").await.unwrap();
+                assert!(parent.is_dir());
+                assert!(store.temp_dir.lock().unwrap().is_some());
+                drop(created);
+                pool.tasks.wait().await;
+            }
+        }
         drop(spill);
         assert_eq!(store.metrics().snapshot().live_files, 0);
         assert_eq!(
