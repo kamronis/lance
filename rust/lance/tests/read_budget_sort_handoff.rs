@@ -60,6 +60,7 @@ impl lance_core::utils::memory::MemoryReserver for StrictBuildPool {
     }
 }
 
+/// Custom ResourceSortStream proof; this is not the stock SortExec proof.
 #[rstest]
 #[case::hard_limit(false)]
 #[case::last_slice(true)]
@@ -279,3 +280,6 @@ async fn read_budget_sort_handoff_respects_build_pool(#[case] last_slice: bool) 
         .unwrap();
     }
 }
+
+#[path = "read_budget_sort_handoff/sortexec.rs"]
+mod sortexec;
